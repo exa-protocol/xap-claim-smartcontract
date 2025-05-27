@@ -318,13 +318,24 @@ contract XAPWithdrawal is Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     IERC20 public immutable xapToken;
-    uint256 public constant MAX_BATCH_SIZE = 200;
+    uint256 public constant MAX_BATCH_SIZE = 150;
 
     // Mapping from user address to the remaining amount they are allowed to withdraw
     mapping(address => uint256) public withdrawableBalance;
 
     // Sum of all withdrawable balances
     uint256 public totalPendingXAPWithdrawals;
+
+    // Custom errors for gas optimization
+    error ZeroAddress();
+    error ZeroAmount();
+    error InsufficientBalance();
+    error ArrayLengthMismatch();
+    error EmptyArray();
+    error BatchSizeExceeded();
+    error AllowanceOverflow();
+    error ETHTransferFailed();
+    error InsufficientContractBalance();
 
     event AllowanceSet(address indexed recipient, uint256 amount);
     event AllowanceAdded(address indexed recipient, uint256 amountAdded);
@@ -342,15 +353,20 @@ contract XAPWithdrawal is Ownable, ReentrancyGuard, Pausable {
     event EtherReceived(address indexed from, uint256 amount);
     event EtherSwept(address indexed to, uint256 amount);
 
+    // Add this validation to all allowance-setting functions
+    modifier sufficientContractBalance() {
+        _;
+        if (xapToken.balanceOf(address(this)) < totalPendingXAPWithdrawals) {
+            revert InsufficientContractBalance();
+        }
+    }
+
     /**
      * @dev Sets the XAP token address. The deployer becomes the owner.
      * @param _xapTokenAddress The address of the XAP ERC20 token contract.
      */
     constructor(address _xapTokenAddress) Ownable(msg.sender) {
-        require(
-            _xapTokenAddress != address(0),
-            "XAP token address cannot be zero"
-        );
+        if (_xapTokenAddress == address(0)) revert ZeroAddress();
         xapToken = IERC20(_xapTokenAddress);
     }
 
@@ -363,16 +379,18 @@ contract XAPWithdrawal is Ownable, ReentrancyGuard, Pausable {
     function setAllowance(
         address _recipient,
         uint256 _amount
-    ) external onlyOwner whenNotPaused {
-        require(
-            _recipient != address(0),
-            "Recipient cannot be the zero address"
-        );
+    ) external onlyOwner whenNotPaused sufficientContractBalance {
+        if (_recipient == address(0)) revert ZeroAddress();
+
         uint256 oldBalance = withdrawableBalance[_recipient];
         withdrawableBalance[_recipient] = _amount;
-        totalPendingXAPWithdrawals =
-            (totalPendingXAPWithdrawals - oldBalance) +
-            _amount; // Adjust total
+
+        unchecked {
+            totalPendingXAPWithdrawals =
+                (totalPendingXAPWithdrawals - oldBalance) +
+                _amount;
+        }
+
         emit AllowanceSet(_recipient, _amount);
     }
 
@@ -391,29 +409,27 @@ contract XAPWithdrawal is Ownable, ReentrancyGuard, Pausable {
     function setAllowanceBatch(
         address[] calldata _recipients,
         uint256[] calldata _amounts
-    ) external onlyOwner whenNotPaused {
-        require(
-            _recipients.length == _amounts.length,
-            "Array lengths must match"
-        );
-        require(_recipients.length > 0, "Arrays cannot be empty");
-        require(
-            _recipients.length <= MAX_BATCH_SIZE,
-            "Batch size exceeds limit"
-        );
+    ) external onlyOwner whenNotPaused sufficientContractBalance {
+        uint256 length = _recipients.length;
+        if (length != _amounts.length) revert ArrayLengthMismatch();
+        if (length == 0) revert EmptyArray();
+        if (length > MAX_BATCH_SIZE) revert BatchSizeExceeded();
 
-        for (uint256 i = 0; i < _recipients.length; i++) {
+        for (uint256 i = 0; i < length; ) {
             address recipient = _recipients[i];
-            require(
-                recipient != address(0),
-                "Recipient cannot be the zero address"
-            );
+            if (recipient == address(0)) revert ZeroAddress();
+
             uint256 oldBalance = withdrawableBalance[recipient];
             uint256 newBalance = _amounts[i];
             withdrawableBalance[recipient] = newBalance;
-            totalPendingXAPWithdrawals =
-                (totalPendingXAPWithdrawals - oldBalance) +
-                newBalance; // Adjust total
+
+            unchecked {
+                totalPendingXAPWithdrawals =
+                    (totalPendingXAPWithdrawals - oldBalance) +
+                    newBalance;
+                ++i;
+            }
+
             emit AllowanceSet(recipient, newBalance);
         }
     }
@@ -432,34 +448,30 @@ contract XAPWithdrawal is Ownable, ReentrancyGuard, Pausable {
     function addAllowanceBatch(
         address[] calldata _recipients,
         uint256[] calldata _amountsToAdd
-    ) external onlyOwner whenNotPaused {
-        require(
-            _recipients.length == _amountsToAdd.length,
-            "Array lengths must match"
-        );
-        require(_recipients.length > 0, "Arrays cannot be empty");
-        require(
-            _recipients.length <= MAX_BATCH_SIZE,
-            "Batch size exceeds limit"
-        );
+    ) external onlyOwner whenNotPaused sufficientContractBalance {
+        uint256 length = _recipients.length;
+        if (length != _amountsToAdd.length) revert ArrayLengthMismatch();
+        if (length == 0) revert EmptyArray();
+        if (length > MAX_BATCH_SIZE) revert BatchSizeExceeded();
 
-        for (uint256 i = 0; i < _recipients.length; i++) {
+        for (uint256 i = 0; i < length; ) {
             address recipient = _recipients[i];
-            require(
-                recipient != address(0),
-                "Recipient cannot be the zero address"
-            );
+            if (recipient == address(0)) revert ZeroAddress();
 
-            //Integer Overflow Check for individual balance
             uint256 currentBalance = withdrawableBalance[recipient];
-            uint256 newBalance = currentBalance + _amountsToAdd[i];
-            require(
-                newBalance >= currentBalance,
-                "Allowance addition would overflow"
-            );
+            uint256 amountToAdd = _amountsToAdd[i];
+            uint256 newBalance = currentBalance + amountToAdd;
+
+            if (newBalance < currentBalance) revert AllowanceOverflow();
+
             withdrawableBalance[recipient] = newBalance;
-            totalPendingXAPWithdrawals += _amountsToAdd[i]; // Adjust total
-            emit AllowanceAdded(recipient, _amountsToAdd[i]);
+            totalPendingXAPWithdrawals += amountToAdd;
+
+            emit AllowanceAdded(recipient, amountToAdd);
+
+            unchecked {
+                ++i;
+            }
         }
     }
 
@@ -472,20 +484,17 @@ contract XAPWithdrawal is Ownable, ReentrancyGuard, Pausable {
     function addAllowance(
         address _recipient,
         uint256 _amountToAdd
-    ) external onlyOwner whenNotPaused {
-        require(
-            _recipient != address(0),
-            "Recipient cannot be the zero address"
-        );
-        //Integer Overflow Check for individual balance
+    ) external onlyOwner whenNotPaused sufficientContractBalance {
+        if (_recipient == address(0)) revert ZeroAddress();
+
         uint256 currentBalance = withdrawableBalance[_recipient];
         uint256 newBalance = currentBalance + _amountToAdd;
-        require(
-            newBalance >= currentBalance,
-            "Allowance addition would overflow"
-        );
+
+        if (newBalance < currentBalance) revert AllowanceOverflow();
+
         withdrawableBalance[_recipient] = newBalance;
-        totalPendingXAPWithdrawals += _amountToAdd; // Adjust total
+        totalPendingXAPWithdrawals += _amountToAdd;
+
         emit AllowanceAdded(_recipient, _amountToAdd);
     }
 
@@ -499,17 +508,16 @@ contract XAPWithdrawal is Ownable, ReentrancyGuard, Pausable {
      * requested amount from the user's withdrawable balance, even if they receive less due to fees.
      */
     function withdraw(uint256 _amount) external nonReentrant whenNotPaused {
-        require(_amount > 0, "Withdraw amount must be greater than zero");
+        if (_amount == 0) revert ZeroAmount();
 
         uint256 availableBalance = withdrawableBalance[msg.sender];
-        require(
-            availableBalance >= _amount,
-            "Insufficient withdrawable balance"
-        );
+        if (availableBalance < _amount) revert InsufficientBalance();
 
         // Effect: Update user's XAP allowance
-        withdrawableBalance[msg.sender] = availableBalance - _amount;
-        totalPendingXAPWithdrawals -= _amount; // Adjust total
+        unchecked {
+            withdrawableBalance[msg.sender] = availableBalance - _amount;
+            totalPendingXAPWithdrawals -= _amount;
+        }
 
         // Interaction: Transfer XAP token. SafeERC20's safeTransfer will handle
         // reverts if the contract has insufficient balance or other transfer issues.
@@ -529,8 +537,8 @@ contract XAPWithdrawal is Ownable, ReentrancyGuard, Pausable {
         address _to,
         uint256 _amount
     ) external onlyOwner nonReentrant {
-        require(_token != address(0), "Token cannot be the zero address");
-        require(_to != address(0), "Recipient cannot be the zero address");
+        if (_token == address(0)) revert ZeroAddress();
+        if (_to == address(0)) revert ZeroAddress();
 
         IERC20(_token).safeTransfer(_to, _amount);
         emit TokensSwept(_token, _to, _amount);
@@ -541,7 +549,7 @@ contract XAPWithdrawal is Ownable, ReentrancyGuard, Pausable {
      * @param _amount The amount of XAP tokens to deposit
      */
     function fundContract(uint256 _amount) external nonReentrant whenNotPaused {
-        require(_amount > 0, "Amount must be greater than zero");
+        if (_amount == 0) revert ZeroAmount();
         xapToken.safeTransferFrom(msg.sender, address(this), _amount);
         emit ContractFunded(msg.sender, _amount);
     }
@@ -560,21 +568,19 @@ contract XAPWithdrawal is Ownable, ReentrancyGuard, Pausable {
         if (recipient == address(0)) {
             recipient = payable(owner());
         }
-        require(recipient != address(0), "Cannot send ETH to zero address");
+        if (recipient == address(0)) revert ZeroAddress();
 
         uint256 amountToSweep = _amount;
         if (amountToSweep == 0) {
             amountToSweep = address(this).balance;
         }
 
-        require(amountToSweep > 0, "No ETH to sweep");
-        require(
-            amountToSweep <= address(this).balance,
-            "Insufficient ETH balance"
-        );
+        if (amountToSweep == 0) revert ZeroAmount();
+        if (amountToSweep > address(this).balance) revert InsufficientBalance();
 
         (bool success, ) = recipient.call{value: amountToSweep}("");
-        require(success, "ETH transfer failed");
+        if (!success) revert ETHTransferFailed();
+
         emit EtherSwept(recipient, amountToSweep);
     }
 
