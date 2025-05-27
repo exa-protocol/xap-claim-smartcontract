@@ -9,9 +9,8 @@ The XAPWithdrawal contract manages XAP token distribution and funds by:
 1. Allowing the contract owner to specify how much XAP each address can withdraw.
 2. Permitting users to withdraw their allocated tokens up to their allowance.
 3. Keeping track of remaining balances for each user.
-4. Automatically detecting fees during token transfers. If a fee is incurred (e.g., for deflationary tokens), the user receives the net amount, but the fee portion is credited back to their `withdrawableBalance`, ensuring their allowance is not unduly consumed by transfer fees.
-5. Providing emergency pause functionality for critical operations.
-6. Accepting native Ether (ETH) sent to the contract, which can be recovered by the owner using the `sweepETH` function.
+4. Providing emergency pause functionality for critical operations.
+5. Accepting native Ether (ETH) sent to the contract, which can be recovered by the owner using the `sweepETH` function.
 
 ## Contract Details
 
@@ -102,17 +101,22 @@ The XAPWithdrawal contract manages XAP token distribution and funds by:
 - Transfers contract ownership to another address.
 - Example: `transferOwnership("0xnew...owner")`
 
+#### `getTotalPendingXAPWithdrawals()`
+
+- Returns the total sum of all XAP allowances currently pending withdrawal.
+- This is a public view function.
+- This provides a quick way to see the contract's total XAP liabilities.
+
 ### For Users
 
 #### `withdraw(uint256 _amount)`
 
 - Allows a user to withdraw their allocated XAP tokens.
-- The user requests `_amount`. Their `withdrawableBalance` is initially debited by this `_amount`.
+- The user requests `_amount`. Their `withdrawableBalance` is debited by this `_amount`.
 - The contract attempts to transfer `_amount` of XAP tokens to the user.
-- If the token transfer incurs a fee (e.g., for deflationary tokens), the user will receive the actual amount (net of fees). The difference (the fee amount) is then credited back to the user's `withdrawableBalance`. This ensures the user's allowance is only reduced by the actual XAP amount they would have received if there were no fees.
-- A `FeeDetected` event is emitted if `actualReceived < _amount`.
+- For fee-on-transfer or deflationary tokens, the user will receive the net amount (after fees), and their `withdrawableBalance` is debited by the full `_amount` requested.
 - Reverts on insufficient initial allowance, insufficient contract balance for the transfer, or if the contract is paused.
-- Emits a `Withdrawn` event on success (logging `actualAmount` received and `requestedAmount`).
+- Emits a `Withdrawn` event on success (logging the `amount` withdrawn, which is both the requested and actual amount from the contract's perspective).
 - Example: To request a withdrawal of 1 XAP: `withdraw(100000000)`
 
 #### `fundContract(uint256 _amount)`
@@ -121,6 +125,18 @@ The XAPWithdrawal contract manages XAP token distribution and funds by:
 - Must be called when the contract is not paused.
 - Emits a `ContractFunded` event.
 - Example: To deposit 10 XAP: `fundContract(1000000000)` (caller must have approved the contract to spend their XAP).
+
+#### `paused()`
+
+- Returns `true` if the contract is paused, `false` otherwise.
+
+#### `MAX_BATCH_SIZE()`
+
+- Returns the maximum number of addresses that can be processed in batch operations (currently 200).
+
+#### `getTotalPendingXAPWithdrawals()`
+
+- Returns the total sum of all XAP allowances currently pending withdrawal. (Public)
 
 ### Other Contract Interactions
 
@@ -144,14 +160,6 @@ The XAPWithdrawal contract manages XAP token distribution and funds by:
 
 - Returns the address of the XAP token contract.
 
-#### `paused()`
-
-- Returns `true` if the contract is paused, `false` otherwise.
-
-#### `MAX_BATCH_SIZE()`
-
-- Returns the maximum number of addresses that can be processed in batch operations (currently 200).
-
 ## Events
 
 - `OwnershipTransferred(address indexed previousOwner, address indexed newOwner)`
@@ -159,7 +167,6 @@ The XAPWithdrawal contract manages XAP token distribution and funds by:
 - `AllowanceAdded(address indexed recipient, uint256 amountAdded)`
 - `Withdrawn(address indexed recipient, uint256 actualAmount, uint256 requestedAmount)`
 - `TokensSwept(address indexed token, address indexed recipient, uint256 amount)`
-- `FeeDetected(address indexed user, uint256 requested, uint256 actualReceived)`
 - `ContractFunded(address indexed funder, uint256 amount)`
 - `Paused(address account)`
 - `Unpaused(address account)`
@@ -220,7 +227,7 @@ The XAPWithdrawal contract manages XAP token distribution and funds by:
 
 - All token amounts are specified in their smallest unit (e.g., if XAP has 18 decimals, 1 XAP = 10^18 units).
 - The contract can receive Ether; the owner can withdraw this Ether using `sweepETH`. An amount of `0` in `sweepETH` will sweep the entire contract balance.
-- For fee-on-transfer tokens, user allowances are preserved. The `withdrawableBalance` is debited by the requested amount, but if a fee is taken by the token contract during transfer, that fee amount is credited back to the user's `withdrawableBalance`.
+- For fee-on-transfer tokens, the user's `withdrawableBalance` is debited by the full requested amount. The user will receive the net amount after any fees imposed by the token contract itself.
 - The contract must have sufficient XAP balance for withdrawals to succeed.
 - **Gas Considerations for Batch Operations (M-3)**: While `MAX_BATCH_SIZE` is 200, using the maximum batch size for `setAllowanceBatch` or `addAllowanceBatch` can lead to very high gas costs, especially if many of the recipients are new (i.e., not previously having an allowance). Each new storage slot initialization (SSTORE for a zero to non-zero value) costs significantly more gas. On networks with lower block gas limits (like some L2s), large batches for new users might exceed the limit. It is strongly recommended to:
   - Test batch sizes on your target network.

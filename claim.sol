@@ -323,6 +323,9 @@ contract XAPWithdrawal is Ownable, ReentrancyGuard, Pausable {
     // Mapping from user address to the remaining amount they are allowed to withdraw
     mapping(address => uint256) public withdrawableBalance;
 
+    // Sum of all withdrawable balances
+    uint256 public totalPendingXAPWithdrawals;
+
     event AllowanceSet(address indexed recipient, uint256 amount);
     event AllowanceAdded(address indexed recipient, uint256 amountAdded);
     event Withdrawn(
@@ -334,11 +337,6 @@ contract XAPWithdrawal is Ownable, ReentrancyGuard, Pausable {
         address indexed token,
         address indexed recipient,
         uint256 amount
-    );
-    event FeeDetected(
-        address indexed user,
-        uint256 requested,
-        uint256 actualReceived
     );
     event ContractFunded(address indexed funder, uint256 amount);
     event EtherReceived(address indexed from, uint256 amount);
@@ -370,7 +368,11 @@ contract XAPWithdrawal is Ownable, ReentrancyGuard, Pausable {
             _recipient != address(0),
             "Recipient cannot be the zero address"
         );
+        uint256 oldBalance = withdrawableBalance[_recipient];
         withdrawableBalance[_recipient] = _amount;
+        totalPendingXAPWithdrawals =
+            (totalPendingXAPWithdrawals - oldBalance) +
+            _amount; // Adjust total
         emit AllowanceSet(_recipient, _amount);
     }
 
@@ -406,9 +408,13 @@ contract XAPWithdrawal is Ownable, ReentrancyGuard, Pausable {
                 recipient != address(0),
                 "Recipient cannot be the zero address"
             );
-
-            withdrawableBalance[recipient] = _amounts[i];
-            emit AllowanceSet(recipient, _amounts[i]);
+            uint256 oldBalance = withdrawableBalance[recipient];
+            uint256 newBalance = _amounts[i];
+            withdrawableBalance[recipient] = newBalance;
+            totalPendingXAPWithdrawals =
+                (totalPendingXAPWithdrawals - oldBalance) +
+                newBalance; // Adjust total
+            emit AllowanceSet(recipient, newBalance);
         }
     }
 
@@ -444,7 +450,15 @@ contract XAPWithdrawal is Ownable, ReentrancyGuard, Pausable {
                 "Recipient cannot be the zero address"
             );
 
-            withdrawableBalance[recipient] += _amountsToAdd[i];
+            //Integer Overflow Check for individual balance
+            uint256 currentBalance = withdrawableBalance[recipient];
+            uint256 newBalance = currentBalance + _amountsToAdd[i];
+            require(
+                newBalance >= currentBalance,
+                "Allowance addition would overflow"
+            );
+            withdrawableBalance[recipient] = newBalance;
+            totalPendingXAPWithdrawals += _amountsToAdd[i]; // Adjust total
             emit AllowanceAdded(recipient, _amountsToAdd[i]);
         }
     }
@@ -463,7 +477,15 @@ contract XAPWithdrawal is Ownable, ReentrancyGuard, Pausable {
             _recipient != address(0),
             "Recipient cannot be the zero address"
         );
-        withdrawableBalance[_recipient] += _amountToAdd;
+        //Integer Overflow Check for individual balance
+        uint256 currentBalance = withdrawableBalance[_recipient];
+        uint256 newBalance = currentBalance + _amountToAdd;
+        require(
+            newBalance >= currentBalance,
+            "Allowance addition would overflow"
+        );
+        withdrawableBalance[_recipient] = newBalance;
+        totalPendingXAPWithdrawals += _amountToAdd; // Adjust total
         emit AllowanceAdded(_recipient, _amountToAdd);
     }
 
@@ -485,38 +507,19 @@ contract XAPWithdrawal is Ownable, ReentrancyGuard, Pausable {
             "Insufficient withdrawable balance"
         );
 
-        // H-01 Fix: Decrement balance before external call
-        // M-2: We will adjust this *after* transfer if fees are detected and refund is needed.
-        // For now, debit the full requested amount.
+        // Effect: Update user's XAP allowance
         withdrawableBalance[msg.sender] = availableBalance - _amount;
+        totalPendingXAPWithdrawals -= _amount; // Adjust total
 
-        uint256 contractBalance = xapToken.balanceOf(address(this));
+        // Interaction: Transfer XAP token. SafeERC20's safeTransfer will handle
+        // reverts if the contract has insufficient balance or other transfer issues.
+        xapToken.safeTransfer(msg.sender, _amount);
 
-        // M-01 Fix: Use require instead of returning false
-        require(contractBalance >= _amount, "Insufficient contract balance");
-
-        uint256 toSend = _amount;
-
-        // For deflationary/fee-on-transfer tokens, measure actual tokens received
-        uint256 preBalance = xapToken.balanceOf(msg.sender);
-        xapToken.safeTransfer(msg.sender, toSend);
-        uint256 postBalance = xapToken.balanceOf(msg.sender);
-
-        uint256 actualReceived = postBalance - preBalance;
-
-        if (actualReceived < toSend) {
-            emit FeeDetected(msg.sender, toSend, actualReceived);
-            // M-2 Fix: Credit back the difference (fee) to user's withdrawable balance
-            uint256 feeAmount = toSend - actualReceived;
-            withdrawableBalance[msg.sender] += feeAmount;
-        }
-
-        emit Withdrawn(msg.sender, actualReceived, _amount);
+        emit Withdrawn(msg.sender, _amount, _amount);
     }
 
     /**
      * @dev Allows the owner to rescue any ERC20 tokens accidentally sent to this contract,
-     * except for the XAP token which is managed via the withdrawal mechanism.
      * @param _token The address of the token to sweep
      * @param _to The address to send the tokens to
      * @param _amount The amount of tokens to sweep
@@ -578,8 +581,17 @@ contract XAPWithdrawal is Ownable, ReentrancyGuard, Pausable {
     /**
      * @dev Accepts Ether sent directly to the contract and emits an EtherReceived event.
      * This allows the contract to gracefully handle accidental or forced ETH transfers.
+     * ETH can be swept later using the sweepETH function.
      */
     receive() external payable {
         emit EtherReceived(msg.sender, msg.value);
+    }
+
+    /**
+     * @dev Returns the total sum of all pending XAP withdrawals.
+     * This is a public view function.
+     */
+    function getTotalPendingXAPWithdrawals() external view returns (uint256) {
+        return totalPendingXAPWithdrawals;
     }
 }
